@@ -1,0 +1,54 @@
+from scapy.all import *
+from scapy.contrib.bgp import *
+import random
+import time
+
+def send_advanced_bgp_fuzz(dst_ip, dst_port=179):
+    ip = IP(dst=dst_ip)
+    fuzz_cases = []
+
+    # Cycle versions from 0–5
+    for version in range(0, 6):
+        for asn in [0, 64512, 65000, 65535]:
+            for hold in [0, 90, 255]:
+                for opt_len in [0, 10, 255]:
+                    fuzz_cases.append((version, asn, hold, opt_len))
+
+    for idx, (version, asn, hold, opt_len) in enumerate(fuzz_cases):
+        src_port = RandShort()
+        syn = TCP(sport=src_port, dport=dst_port, flags='S', seq=1000)
+        syn_ack = sr1(ip/syn, timeout=2, verbose=0)
+
+        if syn_ack is None or not syn_ack.haslayer(TCP) or syn_ack[TCP].flags != 'SA':
+            print(f"[{idx}] [!] No SYN-ACK — Port 179 might be filtered or dropped.")
+            continue
+
+        ack = TCP(sport=src_port, dport=dst_port, flags='A', seq=syn_ack.ack, ack=syn_ack.seq + 1)
+        send(ip/ack, verbose=0)
+
+        # Fuzzed BGP OPEN
+        bgp_open = BGPHeader(type=1)/BGPOpen(
+            version=version,
+            my_as=asn,
+            hold_time=hold,
+            bgp_id=".".join(str(random.randint(1, 254)) for _ in range(4)),
+            opt_param_len=opt_len
+        )
+
+        pkt = ip/TCP(sport=src_port, dport=dst_port, flags='PA', seq=ack.seq, ack=ack.ack)/bgp_open
+        print(f"[{idx}] [+] Sending version={version}, ASN={asn}, hold={hold}, opt_len={opt_len}")
+        response = sr1(pkt, timeout=2, verbose=0)
+
+        if response:
+            print(f"[{idx}] [+] Response: {response.summary()}")
+        else:
+            print(f"[{idx}] [!] No response (possible crash or silent drop)")
+
+        time.sleep(1)
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: sudo python3 bgp_advanced_fuzz.py <target_ip>")
+        sys.exit(1)
+    send_advanced_bgp_fuzz(sys.argv[1])
