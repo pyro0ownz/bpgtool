@@ -1,3 +1,4 @@
+
 from scapy.all import *
 from scapy.contrib.bgp import *
 
@@ -7,7 +8,7 @@ def send_bgp_open(dst_ip, dst_port=179):
     syn = TCP(sport=RandShort(), dport=dst_port, flags='S', seq=1000)
     syn_ack = sr1(ip/syn, timeout=2)
 
-    if syn_ack is None or syn_ack.haslayer(TCP) == False or syn_ack[TCP].flags != 'SA':
+    if syn_ack is None or not syn_ack.haslayer(TCP) or syn_ack[TCP].flags != 'SA':
         print("[!] No SYN-ACK received, port might be filtered or closed.")
         return
 
@@ -25,6 +26,14 @@ def send_bgp_open(dst_ip, dst_port=179):
     pkt = ip/TCP(sport=syn.sport, dport=dst_port, flags='PA', seq=ack.seq, ack=ack.ack)/bgp_open
     send(pkt)
     print("[+] BGP OPEN packet sent to", dst_ip)
+
+    # Capture response
+    response = sr1(pkt, timeout=3)
+    if response:
+        print("[+] Response received:")
+        response.show()
+    else:
+        print("[!] No response after BGP OPEN.")
 
 if __name__ == "__main__":
     import sys
