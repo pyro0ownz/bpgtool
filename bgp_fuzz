@@ -1,0 +1,52 @@
+
+from scapy.all import *
+from scapy.contrib.bgp import *
+import random
+
+def send_fuzzed_bgp_open(dst_ip, dst_port=179):
+    # Generate randomized router ID and ASN for fuzzing
+    random_bgp_id = ".".join(str(random.randint(0, 255)) for _ in range(4))
+    random_asn = random.randint(64512, 65534)  # Reserved private ASN range
+
+    # TCP options for fingerprinting
+    tcp_opts = [('MSS', 1460), ('WScale', 10), ('SAckOK', b''), ('Timestamp', (12345, 0)), ('NOP', None), ('NOP', None)]
+
+    ip = IP(dst=dst_ip, ttl=random.randint(30, 64))  # Randomized TTL for OS fingerprinting
+    syn = TCP(sport=RandShort(), dport=dst_port, flags='S', seq=1000, options=tcp_opts)
+    syn_ack = sr1(ip/syn, timeout=3)
+
+    if syn_ack is None or not syn_ack.haslayer(TCP) or syn_ack[TCP].flags != 'SA':
+        print("[!] No SYN-ACK received. Target might be filtered or closed.")
+        return
+
+    print(f"[+] SYN-ACK received: TTL={syn_ack.ttl}, Window={syn_ack[TCP].window}, Options={syn_ack[TCP].options}")
+
+    ack = TCP(sport=syn.sport, dport=dst_port, flags='A', seq=syn_ack.ack, ack=syn_ack.seq + 1)
+    send(ip/ack)
+
+    # Build fuzzed BGP OPEN with randomized values
+    bgp_open = BGPHeader(type=1)/BGPOpen(
+        version=random.randint(1, 4),  # Fuzz the version
+        my_as=random_asn,
+        hold_time=random.choice([0, 90, 255]),  # Fuzz hold time
+        bgp_id=random_bgp_id,
+        opt_param_len=0
+    )
+
+    pkt = ip/TCP(sport=syn.sport, dport=dst_port, flags='PA', seq=ack.seq, ack=ack.ack)/bgp_open
+    send(pkt)
+    print(f"[+] Fuzzed BGP OPEN sent: version={bgp_open.version}, ASN={random_asn}, ID={random_bgp_id}, hold={bgp_open.hold_time}")
+
+    response = sr1(pkt, timeout=3)
+    if response:
+        print("[+] Response received:")
+        response.show()
+    else:
+        print("[!] No response after fuzzed BGP OPEN.")
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: python3 bgp_fuzz.py <target_ip>")
+        sys.exit(1)
+    send_fuzzed_bgp_open(sys.argv[1])
