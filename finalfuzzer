@@ -1,0 +1,73 @@
+
+from scapy.all import *
+from scapy.contrib.bgp import *
+import random
+import socket
+import time
+
+def get_port_name(port):
+    try:
+        return socket.getservbyport(port)
+    except:
+        return "unknown"
+
+def run_heat_threshold_fuzz(dst_ip, dst_port=179, max_rounds=1000):
+    ip = IP(dst=dst_ip)
+
+    # Setup log
+    with open("codex_heat_leak_log.txt", "w") as log:
+        log.write("Round,Version,ASN,Hold,OptLen,DestPort,SymbolicName,TTL,Summary\n")
+
+    for i in range(max_rounds):
+        version = random.randint(0, 5)
+        asn = random.choice([0, 64512, 65000, 65535])
+        hold = random.choice([0, 90, 255])
+        opt_len = random.choice([0, 10, 255])
+
+        src_port = RandShort()
+        syn = TCP(sport=src_port, dport=dst_port, flags='S', seq=1000)
+        syn_ack = sr1(ip/syn, timeout=2, verbose=0)
+
+        if not syn_ack or not syn_ack.haslayer(TCP) or syn_ack[TCP].flags != 'SA':
+            print(f"[{i}] [!] No SYN-ACK. Port 179 possibly filtered.")
+            continue
+
+        ack = TCP(sport=src_port, dport=dst_port, flags='A', seq=syn_ack.ack, ack=syn_ack.seq + 1)
+        send(ip/ack, verbose=0)
+
+        # Build BGP OPEN with optional garbage payload
+        open_pkt = BGPHeader(type=1)/BGPOpen(
+            version=version,
+            my_as=asn,
+            hold_time=hold,
+            bgp_id=".".join(str(random.randint(1, 254)) for _ in range(4)),
+            opt_param_len=opt_len
+        )/Raw(load=bytes([0x02, 0x01, 0xFF, 0x03, 0x01, 0x01, 0x7F]))
+
+        pkt = ip/TCP(sport=src_port, dport=dst_port, flags='PA', seq=ack.seq, ack=ack.ack)/open_pkt
+        response = sr1(pkt, timeout=2, verbose=0)
+
+        if response and response.haslayer(IP) and response.haslayer(TCP):
+            dst_port = response[TCP].dport
+            ttl = response[IP].ttl
+            port_name = get_port_name(dst_port)
+
+            if port_name not in ["unknown", "bgp"]:
+                print(f"[{i}] [🔥] Leak: {port_name} (port {dst_port}) @ TTL {ttl}")
+            else:
+                print(f"[{i}] [+] Response from port {dst_port} ({port_name})")
+
+            with open("codex_heat_leak_log.txt", "a") as log:
+                log.write(f"{i},{version},{asn},{hold},{opt_len},{dst_port},{port_name},{ttl},{response.summary()}\n")
+        else:
+            print(f"[{i}] [ ] No response or silent drop.")
+
+        time.sleep(0.25)
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) != 2:
+        print("Usage: sudo python3 codex_heat_fuzzer.py <target_ip>")
+        sys.exit(1)
+
+    run_heat_threshold_fuzz(sys.argv[1])
