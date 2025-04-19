@@ -2,8 +2,8 @@
 from scapy.all import *
 from scapy.contrib.bgp import *
 import random
-import socket
 import time
+import socket
 
 def get_port_name(port):
     try:
@@ -11,32 +11,41 @@ def get_port_name(port):
     except:
         return "unknown"
 
-def run_heat_threshold_fuzz(dst_ip, dst_port=179, max_rounds=1000):
+def send_symbolic_leak_fuzz(dst_ip):
     ip = IP(dst=dst_ip)
+    fuzz_cases = []
 
-    # Setup log
-    with open("codex_heat_leak_log.txt", "w") as log:
-        log.write("Round,Version,ASN,Hold,OptLen,DestPort,SymbolicName,TTL,Summary\n")
+    # Build aggressive fuzz patterns
+    versions = range(0, 6)
+    ases = [0, 64512, 65000, 65535]
+    holds = [0, 90, 255]
+    opt_lens = [0, 10, 255]
 
-    for i in range(max_rounds):
-        version = random.randint(0, 5)
-        asn = random.choice([0, 64512, 65000, 65535])
-        hold = random.choice([0, 90, 255])
-        opt_len = random.choice([0, 10, 255])
+    for version in versions:
+        for asn in ases:
+            for hold in holds:
+                for opt_len in opt_lens:
+                    fuzz_cases.append((version, asn, hold, opt_len))
 
+    idx = 0
+    with open("codex_symbolic_179_log.txt", "w") as log:
+        log.write("Round,Version,ASN,Hold,OptLen,SymbolicLeak,TTL,Summary\n")
+
+    for version, asn, hold, opt_len in fuzz_cases:
         src_port = RandShort()
-        syn = TCP(sport=src_port, dport=dst_port, flags='S', seq=1000)
+        syn = TCP(sport=src_port, dport=179, flags='S', seq=1000)
         syn_ack = sr1(ip/syn, timeout=2, verbose=0)
 
         if not syn_ack or not syn_ack.haslayer(TCP) or syn_ack[TCP].flags != 'SA':
-            print(f"[{i}] [!] No SYN-ACK. Port 179 possibly filtered.")
+            print(f"[{idx}] [!] No SYN-ACK — Port 179 possibly filtered or rejected.")
+            idx += 1
             continue
 
-        ack = TCP(sport=src_port, dport=dst_port, flags='A', seq=syn_ack.ack, ack=syn_ack.seq + 1)
+        ack = TCP(sport=src_port, dport=179, flags='A', seq=syn_ack.ack, ack=syn_ack.seq + 1)
         send(ip/ack, verbose=0)
 
-        # Build BGP OPEN with optional garbage payload
-        open_pkt = BGPHeader(type=1)/BGPOpen(
+        # Craft malformed TLV after OPEN
+        bgp_open = BGPHeader(type=1)/BGPOpen(
             version=version,
             my_as=asn,
             hold_time=hold,
@@ -44,30 +53,30 @@ def run_heat_threshold_fuzz(dst_ip, dst_port=179, max_rounds=1000):
             opt_param_len=opt_len
         )/Raw(load=bytes([0x02, 0x01, 0xFF, 0x03, 0x01, 0x01, 0x7F]))
 
-        pkt = ip/TCP(sport=src_port, dport=dst_port, flags='PA', seq=ack.seq, ack=ack.ack)/open_pkt
+        pkt = ip/TCP(sport=src_port, dport=179, flags='PA', seq=ack.seq, ack=ack.ack)/bgp_open
+        print(f"[{idx}] [+] Fuzzing v={version}, ASN={asn}, hold={hold}, opt_len={opt_len} on port 179")
         response = sr1(pkt, timeout=2, verbose=0)
 
         if response and response.haslayer(IP) and response.haslayer(TCP):
             dst_port = response[TCP].dport
             ttl = response[IP].ttl
-            port_name = get_port_name(dst_port)
+            symbolic_name = get_port_name(dst_port)
 
-            if port_name not in ["unknown", "bgp"]:
-                print(f"[{i}] [🔥] Leak: {port_name} (port {dst_port}) @ TTL {ttl}")
+            if symbolic_name not in ["unknown", "bgp"]:
+                print(f"[{idx}] [🔥] Leak Detected: {symbolic_name} (TTL={ttl})")
             else:
-                print(f"[{i}] [+] Response from port {dst_port} ({port_name})")
+                print(f"[{idx}] [+] Response on port 179 — no leak.")
 
-            with open("codex_heat_leak_log.txt", "a") as log:
-                log.write(f"{i},{version},{asn},{hold},{opt_len},{dst_port},{port_name},{ttl},{response.summary()}\n")
+            with open("codex_symbolic_179_log.txt", "a") as log:
+                log.write(f"{idx},{version},{asn},{hold},{opt_len},{symbolic_name},{ttl},{response.summary()}\n")
         else:
-            print(f"[{i}] [ ] No response or silent drop.")
-
+            print(f"[{idx}] [💀] No response (possible silent drop or crash)")
+        idx += 1
         time.sleep(0.25)
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) != 2:
-        print("Usage: sudo python3 codex_heat_fuzzer.py <target_ip>")
+    if len(sys.argv) < 2:
+        print("Usage: sudo python3 codex_symbolic_fuzz_179.py <target_ip>")
         sys.exit(1)
-
-    run_heat_threshold_fuzz(sys.argv[1])
+    send_symbolic_leak_fuzz(sys.argv[1])
